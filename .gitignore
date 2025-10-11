@@ -1,0 +1,19 @@
+﻿# ignore data and large artifacts
+/data/
+/data/*
+!.gitkeep
+
+# ignore model artifacts
+/model_service/models/
+/model_service/models/*
+
+# ignore venv
+.venv/
+env/
+venv/
+
+# OS and editor files
+*.pyc
+__pycache__/
+.vscode/
+.DS_Store
