@@ -20,12 +20,12 @@ from urllib.parse import urlparse
 import tldextract
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
 import xgboost as xgb
 from scipy import sparse
 
 # ---------- Paths ----------
-DATA_PATH = "data/processed/url_features_clean.csv"   # change if different
+DATA_PATH = "data/processed/url_features.csv"   # change if different
 OUT_DIR = Path("model_service/models/pretrained")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -40,31 +40,29 @@ def entropy(s):
         return 0.0
     from collections import Counter
     probs = [v/len(s) for v in Counter(s).values()]
-    return -sum(p*math.log2(p) for p in probs if p>0)
+    return -sum(p*math.log2(p) for p in probs if p > 0)
 
 def extract_url_fields(url: str):
     u = str(url).strip()
     if not u:
         u = ""
-    if not u.startswith(("http://","https://")):
+    if not u.startswith(("http://", "https://")):
         u2 = "http://" + u
     else:
         u2 = u
     parsed = urlparse(u2)
     domain_full = parsed.netloc.lower()
-    # tldextract extracts subdomain.domain.suffix
     tx = tldextract.extract(u2)
     domain = tx.domain or ""
     subdomain = tx.subdomain or ""
     path = parsed.path or ""
     query = parsed.query or ""
     host = domain_full
-    # tokens for TF-IDF: combine domain and path and query
     domain_path = (host + " " + path + " " + query).strip()
     feats = {
         "url_length": len(u),
         "domain_length": len(domain),
-        "subdomain_count": subdomain.count('.')+1 if subdomain else 0,
+        "subdomain_count": subdomain.count('.') + 1 if subdomain else 0,
         "path_length": len(path),
         "query_length": len(query),
         "num_dots": host.count('.'),
@@ -76,8 +74,7 @@ def extract_url_fields(url: str):
         "entropy_domain": entropy(domain),
         "has_https": int(u.lower().startswith("https")),
         "has_ip": int(bool(re.match(r'^\d+\.\d+\.\d+\.\d+$', tx.domain))),
-        "has_porn_token": int(any(k in u.lower() for k in ("porn","xxx","sex","adult","cam","tube"))),
-        # domain_path string for tfidf will be returned separately
+        "has_porn_token": int(any(k in u.lower() for k in ("porn", "xxx", "sex", "adult", "cam", "tube"))),
     }
     return feats, domain_path
 
@@ -86,17 +83,17 @@ print("Loading:", DATA_PATH)
 df = pd.read_csv(DATA_PATH, on_bad_lines='skip', quoting=3)
 df.columns = df.columns.str.strip()
 if 'type' in df.columns and 'label' not in df.columns:
-    df = df.rename(columns={'type':'label'})
+    df = df.rename(columns={'type': 'label'})
 if 'label' not in df.columns:
     raise SystemExit("Dataset must contain 'label' column with values: phishing/adult/legitimate")
 
 df['label'] = df['label'].astype(str).str.strip().str.lower()
 
-# Keep only the 3 classes we want; if other labels exist, map them to 'legitimate'
-allowed = {'phishing','adult','legitimate','benign'}
+allowed = {'phishing', 'adult', 'legitimate', 'benign'}
 df['label'] = df['label'].apply(lambda x: x if x in allowed else 'legitimate')
 
 print("Total rows:", len(df))
+
 # ---------- Feature extraction ----------
 texts = []
 numeric_list = []
@@ -105,14 +102,10 @@ for u in df['url'].astype(str).fillna("").tolist():
     numeric_list.append(feats)
     texts.append(domain_path)
 
-num_df = pd.DataFrame(numeric_list)
-# Fill NA
-num_df = num_df.fillna(0)
+num_df = pd.DataFrame(numeric_list).fillna(0)
 
-# ---------- Optionally add preexisting model scores as features if available ----------
-# If you have preexisting phishing/adult xgb models or mlp, include their probabilities as extra features.
+# ---------- Optional models ----------
 extra_feat_names = []
-# helper to try load and predict
 def try_add_xgb_score(path, name, X_numeric_for_xgb):
     if not Path(path).exists():
         print(f"Optional model {path} not found, skipping {name}")
@@ -120,8 +113,6 @@ def try_add_xgb_score(path, name, X_numeric_for_xgb):
     try:
         model_obj = joblib.load(path)
         print(f"Loaded optional XGBoost model: {path}")
-        # model_obj might be Booster type
-        # create DMatrix with the features the loaded model expects
         d = xgb.DMatrix(X_numeric_for_xgb)
         probs = model_obj.predict(d)
         return probs
@@ -129,45 +120,42 @@ def try_add_xgb_score(path, name, X_numeric_for_xgb):
         print("Failed to use optional xgb model:", e)
         return None
 
-# Prepare numeric matrix for optional models: for simple case use same numeric features
-# (Optional models trained earlier might have different expected features; in that case prediction may fail.)
 numeric_for_optional = num_df.copy()
-
-# try phishing_xgb
 phish_score = try_add_xgb_score("model_service/models/pretrained/phishing_xgb.pkl", "phishing_xgb", numeric_for_optional)
 if phish_score is not None:
     num_df['phishing_xgb_score'] = phish_score
     extra_feat_names.append('phishing_xgb_score')
 
-# try adult_xgb
 adult_score = try_add_xgb_score("model_service/models/pretrained/adult_xgb.pkl", "adult_xgb", numeric_for_optional)
 if adult_score is not None:
     num_df['adult_xgb_score'] = adult_score
     extra_feat_names.append('adult_xgb_score')
 
-# (You can add MLP scores similarly if you have compatible code; skipping automatic MLP inclusion to avoid torch version issues.)
-
-# ---------- TF-IDF on domain+path ----------
+# ---------- TF-IDF ----------
 print("Fitting TF-IDF (char n-grams) on domain+path...")
 tfidf = TfidfVectorizer(analyzer='char', ngram_range=(3,6), max_features=5000)
-X_text = tfidf.fit_transform(texts)  # sparse
-
-# ---------- Combine numeric + text (sparse hstack) ----------
+X_text = tfidf.fit_transform(texts)
 numeric_cols = list(num_df.columns)
 print("Numeric feature columns:", numeric_cols)
 X_num = sparse.csr_matrix(num_df.values.astype(np.float32))
 X = sparse.hstack([X_num, X_text], format='csr')
 
-# ---------- Labels (multi-class) ----------
-label_map = {"phishing":0, "adult":1, "legitimate":2}
+# ---------- Labels ----------
+label_map = {"phishing": 0, "adult": 1, "legitimate": 2}
 y = df['label'].map(label_map).values
+
+if np.isnan(y).any():
+    missing_count = np.isnan(y).sum()
+    print(f"⚠️ Found {missing_count} missing target labels. Dropping those rows.")
+    notnull_mask = ~np.isnan(y)
+    X = X[notnull_mask]
+    y = y[notnull_mask]
 
 # ---------- Train / eval split ----------
 X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
-
 print("Train shape:", X_train.shape, "Val shape:", X_val.shape)
 
-# ---------- Train XGBoost multiclass ----------
+# ---------- Train XGBoost ----------
 num_class = len(label_map)
 params = {
     "objective": "multi:softprob",
@@ -180,30 +168,49 @@ params = {
     "verbosity": 1
 }
 
+# Convert string labels to integers safely
+from sklearn.preprocessing import LabelEncoder
+label_encoder = LabelEncoder()
+y_train = label_encoder.fit_transform(y_train)
+y_val = label_encoder.transform(y_val)
+
+# Save label encoder + map
+joblib.dump(label_encoder, OUT_DIR / "label_encoder.joblib")
+label_map = dict(zip(label_encoder.classes_, label_encoder.transform(label_encoder.classes_)))
+joblib.dump(label_map, LABEL_MAP_OUT)
+
+# Train with early stopping
 dtrain = xgb.DMatrix(X_train, label=y_train)
 dval = xgb.DMatrix(X_val, label=y_val)
 watchlist = [(dtrain, "train"), (dval, "val")]
 
 print("Training XGBoost multiclass...")
-bst = xgb.train(params, dtrain, num_boost_round=1000, evals=watchlist, early_stopping_rounds=20)
+num_round = 300
+bst = xgb.train(
+    params,
+    dtrain,
+    num_boost_round=num_round,
+    evals=watchlist,
+    early_stopping_rounds=30
+)
 
-# Save model & artifacts
+# ---------- Save all artifacts ----------
 bst.save_model(str(MODEL_OUT))
 joblib.dump(tfidf, VECT_OUT)
 joblib.dump(numeric_cols, NUM_FEAT_OUT)
-joblib.dump(label_map, LABEL_MAP_OUT)
-
-print("Saved model to:", MODEL_OUT)
-print("Saved vectorizer to:", VECT_OUT)
-print("Saved numeric feature list to:", NUM_FEAT_OUT)
-print("Saved label map to:", LABEL_MAP_OUT)
+print("✅ Saved model to:", MODEL_OUT)
+print("✅ Saved vectorizer to:", VECT_OUT)
+print("✅ Saved numeric feature list to:", NUM_FEAT_OUT)
+print("✅ Saved label map to:", LABEL_MAP_OUT)
 
 # ---------- Evaluate ----------
 dval_full = xgb.DMatrix(X_val)
-preds = bst.predict(dval_full)  # shape (n, num_class)
+preds = bst.predict(dval_full)
 y_pred = np.argmax(preds, axis=1)
-print("\nClassification report on validation set:")
-print(classification_report(y_val, y_pred, target_names=[k for k in label_map.keys()]))
 
+print("\nClassification report:")
+target_names = [str(c) for c in label_encoder.classes_]
+print(classification_report(y_val, y_pred, target_names=target_names))
 print("Confusion matrix:")
 print(confusion_matrix(y_val, y_pred))
+print(f"\n✅ Validation Accuracy: {accuracy_score(y_val, y_pred):.4f}")
