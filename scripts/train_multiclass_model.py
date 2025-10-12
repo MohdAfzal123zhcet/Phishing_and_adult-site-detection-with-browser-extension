@@ -75,6 +75,12 @@ def extract_url_fields(url: str):
         "has_https": int(u.lower().startswith("https")),
         "has_ip": int(bool(re.match(r'^\d+\.\d+\.\d+\.\d+$', tx.domain))),
         "has_porn_token": int(any(k in u.lower() for k in ("porn", "xxx", "sex", "adult", "cam", "tube"))),
+        "count_special_chars": sum(c in u for c in "@%=&?~"),
+    "is_shortened_url": int(any(x in u.lower() for x in ("bit.ly","tinyurl","goo.gl","t.co","ow.ly"))),
+    "token_count_path": path.count('/') + 1 if path else 0,
+    "has_login_token": int(any(k in u.lower() for k in ("login","signin","verify","update","account","secure"))),
+    "tld_type": 0 if host.endswith((".gov",".edu",".org")) else 1
+
     }
     return feats, domain_path
 
@@ -133,8 +139,18 @@ if adult_score is not None:
 
 # ---------- TF-IDF ----------
 print("Fitting TF-IDF (char n-grams) on domain+path...")
-tfidf = TfidfVectorizer(analyzer='char', ngram_range=(3,6), max_features=5000)
-X_text = tfidf.fit_transform(texts)
+from scipy.sparse import hstack
+tfidf_word = TfidfVectorizer(analyzer='word', ngram_range=(1,2), max_features=3000)
+tfidf_char = TfidfVectorizer(analyzer='char', ngram_range=(3,5), max_features=3000)
+
+X_word = tfidf_word.fit_transform(texts)
+X_char = tfidf_char.fit_transform(texts)
+X_text = hstack([X_word, X_char])
+
+# (optional) save both vectorizers
+joblib.dump(tfidf_word, OUT_DIR / "tfidf_word.joblib")
+joblib.dump(tfidf_char, OUT_DIR / "tfidf_char.joblib")
+
 numeric_cols = list(num_df.columns)
 print("Numeric feature columns:", numeric_cols)
 X_num = sparse.csr_matrix(num_df.values.astype(np.float32))
@@ -161,12 +177,15 @@ params = {
     "objective": "multi:softprob",
     "num_class": num_class,
     "eval_metric": "mlogloss",
-    "eta": 0.05,
+    "eta": 0.1,
     "max_depth": 6,
-    "subsample": 0.8,
-    "colsample_bytree": 0.8,
+    "subsample": 0.9,
+    "colsample_bytree": 0.9,
+    "seed": 42,
     "verbosity": 1
 }
+num_round = 1000
+
 
 # Convert string labels to integers safely
 from sklearn.preprocessing import LabelEncoder
@@ -196,7 +215,8 @@ bst = xgb.train(
 
 # ---------- Save all artifacts ----------
 bst.save_model(str(MODEL_OUT))
-joblib.dump(tfidf, VECT_OUT)
+joblib.dump(tfidf_char, VECT_OUT)   # saving char vectorizer as main
+
 joblib.dump(numeric_cols, NUM_FEAT_OUT)
 print("✅ Saved model to:", MODEL_OUT)
 print("✅ Saved vectorizer to:", VECT_OUT)

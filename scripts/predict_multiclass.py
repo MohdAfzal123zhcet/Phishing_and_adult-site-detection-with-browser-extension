@@ -20,6 +20,16 @@ numeric_cols = joblib.load(NUM_FEAT_PATH)
 label_map = joblib.load(LABEL_MAP_PATH)
 inv_label_map = {v: k for k, v in label_map.items()}
 
+# ---------- (NEW) index -> human label map ----------
+# This ensures we always print the string label alongside numeric index.
+# Adjust the mapping here if your label indices were saved differently.
+IDX_TO_LABEL = {
+    0: "phishing",
+    1: "adult",
+    2: "legitimate"
+}
+
+
 # ---------- Utility ----------
 def entropy(s):
     if not s:
@@ -74,13 +84,13 @@ def predict_url(url):
     d = xgb.DMatrix(X)
     probs = bst.predict(d)[0]  # length = num_classes
 
-    # Map probabilities back to class names
+    # Map probabilities back to class names (uses inv_label_map as before)
     out = {inv_label_map[i]: float(probs[i]) for i in range(len(probs))}
     pred_idx = np.argmax(probs)
     pred_label = inv_label_map[pred_idx]
     confidence = probs[pred_idx]
 
-    return out, pred_label, confidence
+    return probs, out, pred_idx, pred_label, confidence
 
 # ---------- Main ----------
 if __name__ == "__main__":
@@ -90,10 +100,17 @@ if __name__ == "__main__":
     else:
         url = input("Enter URL: ").strip()
 
-    probs, pred_label, confidence = predict_url(url)
+    probs, out, pred_idx, pred_label, confidence = predict_url(url)
 
     print("\nProbabilities:")
-    for k, v in probs.items():
-        print(f"  {k}: {v:.3f}")
+    # Print numeric index + human label (from IDX_TO_LABEL) + probability
+    for i, p in enumerate(probs):
+        human_label = IDX_TO_LABEL.get(i, inv_label_map.get(i, str(i)))
+        print(f"  {i}: {p:.3f}  ->  {human_label}")
 
-print(f"\nPredicted: {str(pred_label).upper()} (confidence={confidence:.3f})")
+    # Also show the mapping-style out dict (if you still want the original keys)
+    # print("\nDetailed probs mapping:", out)
+
+    # Print predicted label both numeric and human-readable
+    pred_label_str = IDX_TO_LABEL.get(int(pred_idx), str(pred_label))
+    print(f"\nPredicted: {pred_idx} -> {pred_label_str.upper()} (confidence={confidence:.3f})")
