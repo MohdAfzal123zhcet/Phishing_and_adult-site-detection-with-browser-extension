@@ -63,7 +63,7 @@ def extract_url_fields(url: str):
     host = parsed.netloc.lower()
 
     # same keyword sets as training
-    adult_keywords = ("porn", "xxx", "sex", "adult", "cam", "tube",
+    adult_keywords = ("porn", "xxx", "sex", "adult", "cam",
                       "nude", "hot", "fuck", "escort", "babe", "boobs")
     phish_keywords = ("login", "signin", "verify", "update", "account",
                       "secure", "bank", "confirm", "wallet", "reset")

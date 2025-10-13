@@ -6,7 +6,7 @@ from urllib.parse import urlparse
 import tldextract
 import xgboost as xgb
 from scipy import sparse
-from scipy.sparse import hstack   # ✅ Added for combining word + char vectors
+from scipy.sparse import hstack   # ✅ For combining word + char vectors
 
 MODEL_PATH = "model_service/models/pretrained/multiclass_xgb.json"
 VECT_PATH = "model_service/models/pretrained/tfidf_vectorizer.joblib"
@@ -24,7 +24,6 @@ numeric_cols = joblib.load(NUM_FEAT_PATH)
 label_map = joblib.load(LABEL_MAP_PATH)
 inv_label_map = {v: k for k, v in label_map.items()}
 
-# ---------- (NEW) index -> human label map ----------
 IDX_TO_LABEL = {
     0: "phishing",
     1: "adult",
@@ -43,7 +42,7 @@ def entropy(s):
 def extract_url_fields(url: str):
     u = str(url).strip()
 
-    # ✅ Always ensure scheme added (this fixes your mismatch)
+    # ✅ Always ensure scheme added
     if not u.startswith(("http://", "https://")):
         u2 = "http://" + u
     else:
@@ -57,8 +56,8 @@ def extract_url_fields(url: str):
     query = parsed.query or ""
     host = parsed.netloc.lower()
 
-    # ✅ same keyword sets as training
-    adult_keywords = ("porn", "xxx", "sex", "adult", "cam", "tube", "nude", "hot", "fuck", "escort", "babe", "boobs")
+    # ✅ Same keyword sets as training
+    adult_keywords = ("porn", "xxx", "sex", "adult", "cam", "nude", "hot", "fuck", "escort", "babe", "boobs")
     phish_keywords = ("login", "signin", "verify", "update", "account", "secure", "bank", "confirm", "wallet", "reset")
 
     feats = {
@@ -90,14 +89,20 @@ def extract_url_fields(url: str):
     return feats, domain_path
 
 
-
 # ---------- Prediction ----------
 def predict_url(url):
+    u = url.lower()
+    adult_keywords = ("porn", "xxx", "sex", "adult", "cam", "nude", "hot", "fuck", "escort", "babe", "boobs")
+
+    # ✅ 1. Keyword shortcut — catches simple adult URLs instantly
+    if any(k in u for k in adult_keywords):
+        return None, {"adult": 1.0}, 1, "adult", 1.0
+
+    # ✅ 2. Otherwise, fall back to ML model
     feats, text = extract_url_fields(url)
     num_vals = [feats.get(c, 0) for c in numeric_cols]
     X_num = sparse.csr_matrix([num_vals], dtype=np.float32)
 
-    # ✅ Use both word + char TF-IDF vectors (same as training)
     X_word = tfidf_word.transform([text])
     X_char = tfidf_char.transform([text])
     X_text = hstack([X_word, X_char])
@@ -105,14 +110,13 @@ def predict_url(url):
     X = hstack([X_num, X_text], format="csr")
 
     d = xgb.DMatrix(X)
-    probs = bst.predict(d)[0]  # length = num_classes
-
-    out = {inv_label_map[i]: float(probs[i]) for i in range(len(probs))}
+    probs = bst.predict(d)[0]
     pred_idx = np.argmax(probs)
     pred_label = inv_label_map[pred_idx]
     confidence = probs[pred_idx]
 
-    return probs, out, pred_idx, pred_label, confidence
+    return probs, {inv_label_map[i]: float(probs[i]) for i in range(len(probs))}, pred_idx, pred_label, confidence
+
 
 
 # ---------- Main ----------
@@ -124,6 +128,11 @@ if __name__ == "__main__":
         url = input("Enter URL: ").strip()
 
     probs, out, pred_idx, pred_label, confidence = predict_url(url)
+
+    # ✅ Handle keyword-shortcut case
+    if probs is None:
+        print(f"\nPredicted: {pred_idx} -> {pred_label.upper()} (confidence={confidence:.3f})")
+        exit(0)
 
     print("\nProbabilities:")
     for i, p in enumerate(probs):
