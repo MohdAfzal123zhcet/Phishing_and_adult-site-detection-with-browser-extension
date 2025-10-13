@@ -6,6 +6,7 @@ from urllib.parse import urlparse
 import tldextract
 import xgboost as xgb
 from scipy import sparse
+from scipy.sparse import hstack   # ✅ Added for combining word + char vectors
 
 MODEL_PATH = "model_service/models/pretrained/multiclass_xgb.json"
 VECT_PATH = "model_service/models/pretrained/tfidf_vectorizer.joblib"
@@ -15,20 +16,20 @@ LABEL_MAP_PATH = "model_service/models/pretrained/label_map.joblib"
 # ---------- Load Artifacts ----------
 bst = xgb.Booster()
 bst.load_model(MODEL_PATH)
-tfidf = joblib.load(VECT_PATH)
+
+# ✅ Load both word and char vectorizers (tuple saved during training)
+tfidf_word, tfidf_char = joblib.load(VECT_PATH)
+
 numeric_cols = joblib.load(NUM_FEAT_PATH)
 label_map = joblib.load(LABEL_MAP_PATH)
 inv_label_map = {v: k for k, v in label_map.items()}
 
 # ---------- (NEW) index -> human label map ----------
-# This ensures we always print the string label alongside numeric index.
-# Adjust the mapping here if your label indices were saved differently.
 IDX_TO_LABEL = {
     0: "phishing",
     1: "adult",
     2: "legitimate"
 }
-
 
 # ---------- Utility ----------
 def entropy(s):
@@ -41,10 +42,13 @@ def entropy(s):
 
 def extract_url_fields(url: str):
     u = str(url).strip()
+
+    # ✅ Always ensure scheme added (this fixes your mismatch)
     if not u.startswith(("http://", "https://")):
         u2 = "http://" + u
     else:
         u2 = u
+
     parsed = urlparse(u2)
     tx = tldextract.extract(u2)
     domain = tx.domain or ""
@@ -53,8 +57,12 @@ def extract_url_fields(url: str):
     query = parsed.query or ""
     host = parsed.netloc.lower()
 
+    # ✅ same keyword sets as training
+    adult_keywords = ("porn", "xxx", "sex", "adult", "cam", "tube", "nude", "hot", "fuck", "escort", "babe", "boobs")
+    phish_keywords = ("login", "signin", "verify", "update", "account", "secure", "bank", "confirm", "wallet", "reset")
+
     feats = {
-        "url_length": len(u),
+        "url_length": len(u2),
         "domain_length": len(domain),
         "subdomain_count": subdomain.count('.') + 1 if subdomain else 0,
         "path_length": len(path),
@@ -63,34 +71,49 @@ def extract_url_fields(url: str):
         "num_hyphen": host.count('-'),
         "num_underscore": host.count('_'),
         "num_slash": path.count('/'),
-        "num_digits": sum(1 for c in u if c.isdigit()),
-        "digit_ratio": sum(1 for c in u if c.isdigit()) / max(1, len(u)),
+        "num_digits": sum(1 for c in u2 if c.isdigit()),
+        "digit_ratio": sum(1 for c in u2 if c.isdigit()) / max(1, len(u2)),
         "entropy_domain": entropy(domain),
-        "has_https": int(u.lower().startswith("https")),
+        "has_https": int(u2.lower().startswith("https")),
         "has_ip": int(bool(re.match(r'^\d+\.\d+\.\d+\.\d+$', tx.domain))),
-        "has_porn_token": int(any(k in u.lower() for k in ("porn", "xxx", "sex", "adult", "cam", "tube"))),
+
+        "has_adult_keyword": int(any(k in u2.lower() for k in adult_keywords)),
+        "has_phish_keyword": int(any(k in u2.lower() for k in phish_keywords)),
+        "count_special_chars": sum(c in u2 for c in "@%=&?~"),
+        "is_shortened_url": int(any(x in u2.lower() for x in ("bit.ly","tinyurl","goo.gl","t.co","ow.ly"))),
+        "token_count_path": path.count('/') + 1 if path else 0,
+        "has_login_token": int(any(k in u2.lower() for k in ("login","signin","verify","update","account","secure"))),
+        "tld_type": 0 if host.endswith((".gov",".edu",".org")) else 1
     }
+
     domain_path = (host + " " + path + " " + query).strip()
     return feats, domain_path
+
+
 
 # ---------- Prediction ----------
 def predict_url(url):
     feats, text = extract_url_fields(url)
     num_vals = [feats.get(c, 0) for c in numeric_cols]
     X_num = sparse.csr_matrix([num_vals], dtype=np.float32)
-    X_text = tfidf.transform([text])
-    X = sparse.hstack([X_num, X_text], format="csr")
+
+    # ✅ Use both word + char TF-IDF vectors (same as training)
+    X_word = tfidf_word.transform([text])
+    X_char = tfidf_char.transform([text])
+    X_text = hstack([X_word, X_char])
+
+    X = hstack([X_num, X_text], format="csr")
 
     d = xgb.DMatrix(X)
     probs = bst.predict(d)[0]  # length = num_classes
 
-    # Map probabilities back to class names (uses inv_label_map as before)
     out = {inv_label_map[i]: float(probs[i]) for i in range(len(probs))}
     pred_idx = np.argmax(probs)
     pred_label = inv_label_map[pred_idx]
     confidence = probs[pred_idx]
 
     return probs, out, pred_idx, pred_label, confidence
+
 
 # ---------- Main ----------
 if __name__ == "__main__":
@@ -103,14 +126,9 @@ if __name__ == "__main__":
     probs, out, pred_idx, pred_label, confidence = predict_url(url)
 
     print("\nProbabilities:")
-    # Print numeric index + human label (from IDX_TO_LABEL) + probability
     for i, p in enumerate(probs):
         human_label = IDX_TO_LABEL.get(i, inv_label_map.get(i, str(i)))
         print(f"  {i}: {p:.3f}  ->  {human_label}")
 
-    # Also show the mapping-style out dict (if you still want the original keys)
-    # print("\nDetailed probs mapping:", out)
-
-    # Print predicted label both numeric and human-readable
     pred_label_str = IDX_TO_LABEL.get(int(pred_idx), str(pred_label))
     print(f"\nPredicted: {pred_idx} -> {pred_label_str.upper()} (confidence={confidence:.3f})")

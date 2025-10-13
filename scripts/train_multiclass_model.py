@@ -4,8 +4,8 @@ Train a single multiclass model (phishing / adult / legitimate).
 
 Outputs:
  - model_service/models/pretrained/multiclass_xgb.json  (xgboost model)
- - model_service/models/pretrained/tfidf_vectorizer.joblib
- - model_service/models/pretrained/numeric_features.joblib   (list of numeric feature names)
+ - model_service/models/pretrained/tfidf_vectorizer.joblib  (word + char tuple)
+ - model_service/models/pretrained/numeric_features.joblib
  - model_service/models/pretrained/label_map.joblib
 """
 
@@ -25,7 +25,7 @@ import xgboost as xgb
 from scipy import sparse
 
 # ---------- Paths ----------
-DATA_PATH = "data/processed/url_features.csv"   # change if different
+DATA_PATH = "data/processed/url_features.csv"
 OUT_DIR = Path("model_service/models/pretrained")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -50,6 +50,7 @@ def extract_url_fields(url: str):
         u2 = "http://" + u
     else:
         u2 = u
+
     parsed = urlparse(u2)
     domain_full = parsed.netloc.lower()
     tx = tldextract.extract(u2)
@@ -58,7 +59,13 @@ def extract_url_fields(url: str):
     path = parsed.path or ""
     query = parsed.query or ""
     host = domain_full
+
+    # ✅ Extended adult and phishing keyword sets
+    adult_keywords = ("porn", "xxx", "sex", "adult", "cam", "tube", "nude", "hot", "fuck", "escort", "babe", "boobs")
+    phish_keywords = ("login", "signin", "verify", "update", "account", "secure", "bank", "confirm", "wallet", "reset")
+
     domain_path = (host + " " + path + " " + query).strip()
+
     feats = {
         "url_length": len(u),
         "domain_length": len(domain),
@@ -74,17 +81,23 @@ def extract_url_fields(url: str):
         "entropy_domain": entropy(domain),
         "has_https": int(u.lower().startswith("https")),
         "has_ip": int(bool(re.match(r'^\d+\.\d+\.\d+\.\d+$', tx.domain))),
-        "has_porn_token": int(any(k in u.lower() for k in ("porn", "xxx", "sex", "adult", "cam", "tube"))),
-        "count_special_chars": sum(c in u for c in "@%=&?~"),
-    "is_shortened_url": int(any(x in u.lower() for x in ("bit.ly","tinyurl","goo.gl","t.co","ow.ly"))),
-    "token_count_path": path.count('/') + 1 if path else 0,
-    "has_login_token": int(any(k in u.lower() for k in ("login","signin","verify","update","account","secure"))),
-    "tld_type": 0 if host.endswith((".gov",".edu",".org")) else 1
 
+        # ✅ New adult + phishing features
+        "has_adult_keyword": int(any(k in u.lower() for k in adult_keywords)),
+        "has_phish_keyword": int(any(k in u.lower() for k in phish_keywords)),
+
+        # ✅ Extra engineered features
+        "count_special_chars": sum(c in u for c in "@%=&?~"),
+        "is_shortened_url": int(any(x in u.lower() for x in ("bit.ly", "tinyurl", "goo.gl", "t.co", "ow.ly"))),
+        "token_count_path": path.count('/') + 1 if path else 0,
+        "has_login_token": int(any(k in u.lower() for k in ("login", "signin", "verify", "update", "account", "secure"))),
+        "tld_type": 0 if host.endswith((".gov", ".edu", ".org")) else 1
     }
+
     return feats, domain_path
 
-# ---------- Load data ----------
+
+# ---------- Load Data ----------
 print("Loading:", DATA_PATH)
 df = pd.read_csv(DATA_PATH, on_bad_lines='skip', quoting=3)
 df.columns = df.columns.str.strip()
@@ -94,13 +107,11 @@ if 'label' not in df.columns:
     raise SystemExit("Dataset must contain 'label' column with values: phishing/adult/legitimate")
 
 df['label'] = df['label'].astype(str).str.strip().str.lower()
-
 allowed = {'phishing', 'adult', 'legitimate', 'benign'}
 df['label'] = df['label'].apply(lambda x: x if x in allowed else 'legitimate')
-
 print("Total rows:", len(df))
 
-# ---------- Feature extraction ----------
+# ---------- Feature Extraction ----------
 texts = []
 numeric_list = []
 for u in df['url'].astype(str).fillna("").tolist():
@@ -110,35 +121,8 @@ for u in df['url'].astype(str).fillna("").tolist():
 
 num_df = pd.DataFrame(numeric_list).fillna(0)
 
-# ---------- Optional models ----------
-extra_feat_names = []
-def try_add_xgb_score(path, name, X_numeric_for_xgb):
-    if not Path(path).exists():
-        print(f"Optional model {path} not found, skipping {name}")
-        return None
-    try:
-        model_obj = joblib.load(path)
-        print(f"Loaded optional XGBoost model: {path}")
-        d = xgb.DMatrix(X_numeric_for_xgb)
-        probs = model_obj.predict(d)
-        return probs
-    except Exception as e:
-        print("Failed to use optional xgb model:", e)
-        return None
-
-numeric_for_optional = num_df.copy()
-phish_score = try_add_xgb_score("model_service/models/pretrained/phishing_xgb.pkl", "phishing_xgb", numeric_for_optional)
-if phish_score is not None:
-    num_df['phishing_xgb_score'] = phish_score
-    extra_feat_names.append('phishing_xgb_score')
-
-adult_score = try_add_xgb_score("model_service/models/pretrained/adult_xgb.pkl", "adult_xgb", numeric_for_optional)
-if adult_score is not None:
-    num_df['adult_xgb_score'] = adult_score
-    extra_feat_names.append('adult_xgb_score')
-
 # ---------- TF-IDF ----------
-print("Fitting TF-IDF (char n-grams) on domain+path...")
+print("Fitting TF-IDF (word + char n-grams)...")
 from scipy.sparse import hstack
 tfidf_word = TfidfVectorizer(analyzer='word', ngram_range=(1,2), max_features=3000)
 tfidf_char = TfidfVectorizer(analyzer='char', ngram_range=(3,5), max_features=3000)
@@ -147,9 +131,8 @@ X_word = tfidf_word.fit_transform(texts)
 X_char = tfidf_char.fit_transform(texts)
 X_text = hstack([X_word, X_char])
 
-# (optional) save both vectorizers
-joblib.dump(tfidf_word, OUT_DIR / "tfidf_word.joblib")
-joblib.dump(tfidf_char, OUT_DIR / "tfidf_char.joblib")
+# ✅ Save both vectorizers together as tuple
+joblib.dump((tfidf_word, tfidf_char), VECT_OUT)
 
 numeric_cols = list(num_df.columns)
 print("Numeric feature columns:", numeric_cols)
@@ -159,19 +142,16 @@ X = sparse.hstack([X_num, X_text], format='csr')
 # ---------- Labels ----------
 label_map = {"phishing": 0, "adult": 1, "legitimate": 2}
 y = df['label'].map(label_map).values
-
 if np.isnan(y).any():
-    missing_count = np.isnan(y).sum()
-    print(f"⚠️ Found {missing_count} missing target labels. Dropping those rows.")
     notnull_mask = ~np.isnan(y)
     X = X[notnull_mask]
     y = y[notnull_mask]
 
-# ---------- Train / eval split ----------
+# ---------- Train/Test Split ----------
 X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
 print("Train shape:", X_train.shape, "Val shape:", X_val.shape)
 
-# ---------- Train XGBoost ----------
+# ---------- Train Model ----------
 num_class = len(label_map)
 params = {
     "objective": "multi:softprob",
@@ -184,39 +164,25 @@ params = {
     "seed": 42,
     "verbosity": 1
 }
-num_round = 1000
 
-
-# Convert string labels to integers safely
 from sklearn.preprocessing import LabelEncoder
 label_encoder = LabelEncoder()
 y_train = label_encoder.fit_transform(y_train)
 y_val = label_encoder.transform(y_val)
-
-# Save label encoder + map
 joblib.dump(label_encoder, OUT_DIR / "label_encoder.joblib")
+
 label_map = dict(zip(label_encoder.classes_, label_encoder.transform(label_encoder.classes_)))
 joblib.dump(label_map, LABEL_MAP_OUT)
 
-# Train with early stopping
 dtrain = xgb.DMatrix(X_train, label=y_train)
 dval = xgb.DMatrix(X_val, label=y_val)
 watchlist = [(dtrain, "train"), (dval, "val")]
 
 print("Training XGBoost multiclass...")
-num_round = 300
-bst = xgb.train(
-    params,
-    dtrain,
-    num_boost_round=num_round,
-    evals=watchlist,
-    early_stopping_rounds=30
-)
+bst = xgb.train(params, dtrain, num_boost_round=300, evals=watchlist, early_stopping_rounds=30)
 
-# ---------- Save all artifacts ----------
+# ---------- Save Artifacts ----------
 bst.save_model(str(MODEL_OUT))
-joblib.dump(tfidf_char, VECT_OUT)   # saving char vectorizer as main
-
 joblib.dump(numeric_cols, NUM_FEAT_OUT)
 print("✅ Saved model to:", MODEL_OUT)
 print("✅ Saved vectorizer to:", VECT_OUT)
@@ -227,7 +193,6 @@ print("✅ Saved label map to:", LABEL_MAP_OUT)
 dval_full = xgb.DMatrix(X_val)
 preds = bst.predict(dval_full)
 y_pred = np.argmax(preds, axis=1)
-
 print("\nClassification report:")
 target_names = [str(c) for c in label_encoder.classes_]
 print(classification_report(y_val, y_pred, target_names=target_names))

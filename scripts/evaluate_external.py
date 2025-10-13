@@ -4,6 +4,7 @@ import pandas as pd
 import numpy as np
 import xgboost as xgb
 from scipy import sparse
+from scipy.sparse import hstack   # ✅ added
 from sklearn.metrics import classification_report, accuracy_score
 from urllib.parse import urlparse
 import tldextract
@@ -22,22 +23,20 @@ DATA_PATH = "data/external/test_urls.csv"   # 👈 your external test CSV path
 print("🔹 Loading model and vectorizer...")
 bst = xgb.Booster()
 bst.load_model(MODEL_PATH)
-tfidf = joblib.load(VECT_PATH)
+
+# ✅ Load both word + char TF-IDF vectorizers (tuple)
+tfidf_word, tfidf_char = joblib.load(VECT_PATH)
+
 numeric_cols = joblib.load(NUM_FEAT_PATH)
 
 # --- Load and auto-fix label_map ---
 label_map_raw = joblib.load(LABEL_MAP_PATH)
-
-# Auto-detect wrong format
 if all(isinstance(k, (int, float, np.integer, np.floating)) for k in label_map_raw.keys()):
     print("⚙️ Detected numeric keys in label_map — using training-time order (phishing=0, adult=1, legitimate=2)")
-    label_map = {'phishing': 0, 'adult': 1, 'legitimate': 2}  # ✅ matches training
-
+    label_map = {'phishing': 0, 'adult': 1, 'legitimate': 2}
 elif all(isinstance(v, (str,)) for v in label_map_raw.values()):
-    # If reversed mapping (int→label)
     label_map = {v.lower().strip(): k for k, v in label_map_raw.items()}
 else:
-    # Normal mapping (label→int)
     label_map = {str(k).lower().strip(): v for k, v in label_map_raw.items()}
 
 inv_label_map = {v: k for k, v in label_map.items()}
@@ -63,6 +62,12 @@ def extract_url_fields(url: str):
     query = parsed.query or ""
     host = parsed.netloc.lower()
 
+    # same keyword sets as training
+    adult_keywords = ("porn", "xxx", "sex", "adult", "cam", "tube",
+                      "nude", "hot", "fuck", "escort", "babe", "boobs")
+    phish_keywords = ("login", "signin", "verify", "update", "account",
+                      "secure", "bank", "confirm", "wallet", "reset")
+
     feats = {
         "url_length": len(u),
         "domain_length": len(domain),
@@ -78,15 +83,22 @@ def extract_url_fields(url: str):
         "entropy_domain": entropy(domain),
         "has_https": int(u.lower().startswith("https")),
         "has_ip": int(bool(re.match(r'^\d+\.\d+\.\d+\.\d+$', tx.domain))),
-        "has_porn_token": int(any(k in u.lower() for k in ("porn", "xxx", "sex", "adult", "cam", "tube"))),
+        "has_adult_keyword": int(any(k in u.lower() for k in adult_keywords)),
+        "has_phish_keyword": int(any(k in u.lower() for k in phish_keywords)),
+        "count_special_chars": sum(c in u for c in "@%=&?~"),
+        "is_shortened_url": int(any(x in u.lower() for x in ("bit.ly", "tinyurl", "goo.gl", "t.co", "ow.ly"))),
+        "token_count_path": path.count('/') + 1 if path else 0,
+        "has_login_token": int(any(k in u.lower() for k in ("login", "signin", "verify", "update", "account", "secure"))),
+        "tld_type": 0 if host.endswith((".gov", ".edu", ".org")) else 1
     }
+
     domain_path = (host + " " + path + " " + query).strip()
     return feats, domain_path
+
 
 # ---------- Load External Data ----------
 print("🔹 Loading external test data...")
 df = pd.read_csv(DATA_PATH)
-
 if 'url' not in df.columns or 'label' not in df.columns:
     raise ValueError("⚠️ CSV must contain 'url' and 'label' columns for evaluation.")
 
@@ -116,8 +128,13 @@ for u in urls:
     text_list.append(text)
 
 X_num = sparse.csr_matrix(num_feat_list, dtype=np.float32)
-X_text = tfidf.transform(text_list)
-X = sparse.hstack([X_num, X_text], format="csr")
+
+# ✅ Use both word + char TF-IDF vectors
+X_word = tfidf_word.transform(text_list)
+X_char = tfidf_char.transform(text_list)
+X_text = hstack([X_word, X_char])
+
+X = hstack([X_num, X_text], format="csr")
 
 # ---------- Predict ----------
 print("🔹 Predicting...")
