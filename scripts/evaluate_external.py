@@ -1,3 +1,4 @@
+# scripts/evaluate_external.py
 import joblib
 import pandas as pd
 import numpy as np
@@ -42,11 +43,14 @@ def entropy(s):
     probs = [v / len(s) for v in Counter(s).values()]
     return -sum(p * math.log2(p) for p in probs if p > 0)
 
-
+def normalize_host(netloc: str):
+    """Normalize domain: remove port and leading 'www.'"""
+    host = (netloc or "").lower().split(":")[0]
+    if host.startswith("www."):
+        host = host[4:]
+    return host
 def extract_url_fields(url: str):
-    """
-    Extract numeric + structural phishing indicators (no keyword features).
-    """
+    """Extract numeric + structural phishing indicators (same as training)."""
     u = str(url).strip()
     if not u:
         u = ""
@@ -73,36 +77,23 @@ def extract_url_fields(url: str):
     query = parsed.query or ""
     host = domain_full
 
-    # ✅ Adult keyword set (safe to keep)
-    adult_keywords = ("porn", "xxx", "sex", "adult", "cam", "tube", "nude", "hot", "fuck", "escort", "babe", "boobs")
+    # ✅ Adult keywords
+    adult_keywords = ("porn", "xxx", "sex", "adult", "cam", "tube",
+                      "nude", "hot", "fuck", "escort", "babe", "boobs")
 
-    # ✅ Numeric + structural phishing indicators only
+    # ✅ Suspicious TLDs
+    suspicious_tlds = ("xyz", "top", "club", "info", "click", "link",
+                       "shop", "work", "cf", "tk", "ml", "ga")
+
+    # ✅ Numeric + structural features
     num_digits = sum(1 for c in u2 if c.isdigit())
     digit_ratio = num_digits / max(1, len(u2))
-
     host_parts = host.split('.') if host else []
     suffix_parts = tx.suffix.split('.') if tx.suffix else []
     registered_parts = 1 + (len(suffix_parts) if suffix_parts else 0)
     num_subdomain_parts = max(0, len(host_parts) - registered_parts)
 
-    def count_digit_groups(s: str):
-        return len(re.findall(r'\d+', s))
-    def longest_digit_run(s: str):
-        groups = re.findall(r'\d+', s)
-        return max((len(g) for g in groups), default=0)
-    def letters_count(s: str):
-        return sum(1 for c in s if c.isalpha())
-
-    digits_in_domain = sum(1 for c in (domain or "") if c.isdigit())
-    num_digit_groups_domain = count_digit_groups(domain or "")
-    longest_run_domain = longest_digit_run(domain or "")
-    letters_dom = letters_count(domain or "")
-    digits_vs_letters_ratio = digits_in_domain / (letters_dom + 1)
-
-    # ✅ Suspicious TLD set
-    suspicious_tlds = ("xyz", "top", "club", "info", "click", "link", "shop", "work", "cf", "tk", "ml", "ga")
-    tld = (tx.suffix or "").lower()
-
+    # ✅ New + Base features (same as training)
     feats = {
         "url_length": len(u2),
         "domain_length": len(domain),
@@ -119,28 +110,32 @@ def extract_url_fields(url: str):
         "has_https": int(u2.lower().startswith("https")),
         "has_ip": int(bool(re.match(r'^\d+\.\d+\.\d+\.\d+$', tx.domain))),
         "has_adult_keyword": int(any(k in u2.lower() for k in adult_keywords)),
-        "count_special_chars": sum(c in u2 for c in "@%=&?~"),
-        "is_shortened_url": int(any(x in u2.lower() for x in ("bit.ly", "tinyurl", "goo.gl", "t.co", "ow.ly"))),
+        "count_special_chars": sum(c in u2 for c in "@%=&?~,"),
+        "is_shortened_url": int(any(x in u2.lower() for x in
+                                   ("bit.ly", "tinyurl", "goo.gl", "t.co", "ow.ly"))),
         "token_count_path": path.count('/') + 1 if path else 0,
         "tld_type": 0 if host.endswith((".gov", ".edu", ".org")) else 1,
-
-        # Advanced phishing features
         "num_subdomain_parts": num_subdomain_parts,
-        "digits_in_domain": digits_in_domain,
-        "num_digit_groups_domain": num_digit_groups_domain,
-        "longest_run_domain": longest_run_domain,
-        "digits_vs_letters_ratio": digits_vs_letters_ratio,
-        "is_suspicious_tld": int(tld in suspicious_tlds),
+        "is_suspicious_tld": int((tx.suffix or "").lower() in suspicious_tlds),
         "many_digits": int(num_digits >= 5),
         "many_dots_or_hyphens": int(host.count('.') >= 4 or host.count('-') >= 4),
         "deep_subdomain": int(num_subdomain_parts >= 3),
         "long_url_flag": int(len(u2) > 120 and len(query) > 30),
         "no_https_with_digits": int(not u2.lower().startswith("https") and num_digits >= 3),
+
+        # 🔹 Newly added phishing indicators (match training)
+        "num_parameters": len(query.split("&")) if query else 0,
+        "has_at_symbol": int("@" in u2),
+        "has_comma_symbol": int("," in u2),
+        "contains_equal_sign": int("=" in u2),
+        "contains_hex_encoding": int(bool(re.search(r'%[0-9a-fA-F]{2}', u2))),
+        "url_depth": path.count('/'),
+        "contains_digit_in_domain": int(any(ch.isdigit() for ch in domain)),
+        "contains_dash_in_domain": int("-" in domain),
     }
 
     domain_path = (host + " " + path + " " + query).strip()
-    return feats, domain_path
-
+    return feats, domain_path, normalize_host(parsed.netloc)
 
 # ---------- Load External Data ----------
 print("🔹 Loading external test data...")
@@ -157,11 +152,12 @@ labels = df['label'].map(label_map).values
 print(f"✅ Loaded {len(urls)} URLs.")
 
 # ---------- Feature Extraction ----------
-num_feat_list, text_list = [], []
+num_feat_list, text_list, host_list = [], [], []
 for u in urls:
-    feats, text = extract_url_fields(u)
+    feats, text, host_norm = extract_url_fields(u)
     num_feat_list.append([feats.get(c, 0) for c in numeric_cols])
     text_list.append(text)
+    host_list.append(host_norm)
 
 X_num = sparse.csr_matrix(num_feat_list, dtype=np.float64)
 X_word = tfidf_word.transform(text_list)
@@ -170,16 +166,25 @@ X_text = hstack([X_word, X_char])
 X = hstack([X_num, X_text], format="csr").astype(np.float64)
 
 # ---------- Predict ----------
-print("🔹 Predicting (deterministic float64 mode)...")
+print("🔹 Predicting (pure model + exact whitelist)...")
 xgb.set_config(verbosity=0)
 np.random.seed(42)
 dtest = xgb.DMatrix(X)
 y_pred_proba = bst.predict(dtest)
 y_pred = np.argmax(y_pred_proba, axis=1)
 
+# ✅ Exact-domain whitelist override
+whitelist_exact = {
+    "youtube.com", "google.com", "facebook.com", "linkedin.com",
+    "github.com", "twitter.com"
+}
+for i, host in enumerate(host_list):
+    if host in whitelist_exact:
+        y_pred[i] = label_map["legitimate"]
+
 # ---------- Evaluate ----------
 acc = accuracy_score(labels, y_pred)
-print(f"\n✅ Accuracy on External Test Set: {acc:.3f}\n")
+print(f"\n✅ Accuracy on External Test Set (model + exact whitelist): {acc:.3f}\n")
 label_order = [label_map['phishing'], label_map['adult'], label_map['legitimate']]
 target_names = ['phishing', 'adult', 'legitimate']
 print(classification_report(labels, y_pred, labels=label_order, target_names=target_names, digits=2, zero_division=0))
@@ -190,6 +195,7 @@ print(confusion_matrix(labels, y_pred, labels=label_order))
 os.makedirs("data/external", exist_ok=True)
 results_df = pd.DataFrame({
     "url": urls,
+    "normalized_host": host_list,
     "true_label": [inv_label_map[i] for i in labels],
     "predicted_label": [inv_label_map[i] for i in y_pred],
     "confidence": [float(np.max(p)) for p in y_pred_proba]

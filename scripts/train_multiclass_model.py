@@ -65,16 +65,19 @@ def extract_url_fields(url: str):
     query = parsed.query or ""
     host = domain_full
 
-    # ✅ Adult keyword set (safe to keep)
+    # ✅ Adult keyword set (as before)
     adult_keywords = ("porn", "xxx", "sex", "adult", "cam", "tube", "nude", "hot", "fuck", "escort", "babe", "boobs")
 
-    # ✅ Numeric + structural phishing indicators only
-    num_digits = sum(1 for c in u if c.isdigit())
+    # ✅ Suspicious TLDs
+    suspicious_tlds = ("xyz", "top", "club", "info", "click", "link", "shop", "work", "cf", "tk", "ml", "ga")
+
+    # ✅ Numeric and structural base
+    num_digits = sum(1 for c in u2 if c.isdigit())
     num_dots = host.count('.')
     num_hyphen = host.count('-')
-    url_len = len(u)
+    url_len = len(u2)
     query_len = len(query)
-    has_https = int(u.lower().startswith("https"))
+    has_https = int(u2.lower().startswith("https"))
 
     # ✅ Domain decomposition
     host_parts = host.split('.') if host else []
@@ -82,11 +85,7 @@ def extract_url_fields(url: str):
     registered_parts = 1 + (len(suffix_parts) if suffix_parts else 0)
     num_subdomain_parts = max(0, len(host_parts) - registered_parts)
 
-    # ✅ Suspicious TLDs
-    suspicious_tlds = ("xyz", "top", "club", "info", "click", "link", "shop", "work", "cf", "tk", "ml", "ga")
-    tld = (tx.suffix or "").lower()
-
-    # ✅ Base features
+    # ✅ Extra URL-based phishing indicators (NEW)
     feats = {
         "url_length": url_len,
         "domain_length": len(domain),
@@ -98,18 +97,29 @@ def extract_url_fields(url: str):
         "num_underscore": host.count('_'),
         "num_slash": path.count('/'),
         "num_digits": num_digits,
-        "digit_ratio": num_digits / max(1, len(u)),
+        "digit_ratio": num_digits / max(1, len(u2)),
         "entropy_domain": entropy(domain),
         "has_https": has_https,
         "has_ip": int(bool(re.match(r'^\d+\.\d+\.\d+\.\d+$', tx.domain))),
-        "has_adult_keyword": int(any(k in u.lower() for k in adult_keywords)),
-        "count_special_chars": sum(c in u for c in "@%=&?~"),
-        "is_shortened_url": int(any(x in u.lower() for x in ("bit.ly", "tinyurl", "goo.gl", "t.co", "ow.ly"))),
+        "has_adult_keyword": int(any(k in u2.lower() for k in adult_keywords)),
+        "count_special_chars": sum(c in u2 for c in "@%=&?~,"),
+        "is_shortened_url": int(any(x in u2.lower() for x in ("bit.ly", "tinyurl", "goo.gl", "t.co", "ow.ly"))),
         "token_count_path": path.count('/') + 1 if path else 0,
         "tld_type": 0 if host.endswith((".gov", ".edu", ".org")) else 1,
+
+        # 🔹 Newly Added Features
+        "num_parameters": len(query.split("&")) if query else 0,
+        "has_at_symbol": int("@" in u2),
+        "has_comma_symbol": int("," in u2),
+        "contains_equal_sign": int("=" in u2),
+        "contains_hex_encoding": int(bool(re.search(r'%[0-9a-fA-F]{2}', u2))),
+        "url_depth": path.count('/'),
+        "contains_digit_in_domain": int(any(ch.isdigit() for ch in domain)),
+        "contains_dash_in_domain": int("-" in domain),
     }
 
-    # ✅ Advanced phishing pattern-based features
+    # ✅ Advanced phishing indicators (same as before)
+    tld = (tx.suffix or "").lower()
     feats["is_suspicious_tld"] = int(tld in suspicious_tlds)
     feats["many_digits"] = int(num_digits >= 5)
     feats["many_dots_or_hyphens"] = int(num_dots >= 4 or num_hyphen >= 4)

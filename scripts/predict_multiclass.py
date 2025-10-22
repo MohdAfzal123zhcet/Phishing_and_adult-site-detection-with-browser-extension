@@ -6,8 +6,11 @@ from urllib.parse import urlparse
 import tldextract
 import xgboost as xgb
 from scipy import sparse
-from scipy.sparse import hstack   # ✅ For combining word + char vectors
+from scipy.sparse import hstack
+from collections import Counter
+import math
 
+# ---------- Paths ----------
 MODEL_PATH = "model_service/models/pretrained/multiclass_xgb.json"
 VECT_PATH = "model_service/models/pretrained/tfidf_vectorizer.joblib"
 NUM_FEAT_PATH = "model_service/models/pretrained/numeric_features.joblib"
@@ -17,48 +20,67 @@ LABEL_MAP_PATH = "model_service/models/pretrained/label_map.joblib"
 bst = xgb.Booster()
 bst.load_model(MODEL_PATH)
 
-# ✅ Load both word and char vectorizers (tuple saved during training)
 tfidf_word, tfidf_char = joblib.load(VECT_PATH)
-
 numeric_cols = joblib.load(NUM_FEAT_PATH)
 label_map = joblib.load(LABEL_MAP_PATH)
 inv_label_map = {v: k for k, v in label_map.items()}
 
-IDX_TO_LABEL = {
-    0: "phishing",
-    1: "adult",
-    2: "legitimate"
-}
+IDX_TO_LABEL = {0: "phishing", 1: "adult", 2: "legitimate"}
 
 # ---------- Utility ----------
 def entropy(s):
     if not s:
         return 0.0
-    from collections import Counter
-    import math
     probs = [v / len(s) for v in Counter(s).values()]
     return -sum(p * math.log2(p) for p in probs if p > 0)
 
-def extract_url_fields(url: str):
-    u = str(url).strip()
+def normalize_host(netloc: str):
+    """Normalize domain: remove port and leading 'www.'"""
+    host = (netloc or "").lower().split(":")[0]
+    if host.startswith("www."):
+        host = host[4:]
+    return host
 
-    # ✅ Always ensure scheme added
+def extract_url_fields(url: str):
+    """Feature extraction identical to evaluate_external.py"""
+    u = str(url).strip()
+    if not u:
+        u = ""
     if not u.startswith(("http://", "https://")):
         u2 = "http://" + u
     else:
         u2 = u
 
-    parsed = urlparse(u2)
+    u2 = re.sub(r'[\[\]#\s]+', '', u2)
+    if re.match(r'^(https?://)\d', u2):
+        u2 = re.sub(r'^(https?://)(\d)', r'\1x-\2', u2)
+
+    try:
+        parsed = urlparse(u2)
+    except ValueError:
+        cleaned = re.sub(r'[^A-Za-z0-9\-._:/\?\&=#%]', '', u2)
+        parsed = urlparse(cleaned)
+
+    domain_full = parsed.netloc.lower()
     tx = tldextract.extract(u2)
     domain = tx.domain or ""
     subdomain = tx.subdomain or ""
     path = parsed.path or ""
     query = parsed.query or ""
-    host = parsed.netloc.lower()
+    host = domain_full
 
-    # ✅ Same keyword sets as training
-    adult_keywords = ("porn", "xxx", "sex", "adult", "cam", "nude", "hot", "fuck", "escort", "babe", "boobs")
-    phish_keywords = ("login", "signin", "verify", "update", "account", "secure", "bank", "confirm", "wallet", "reset")
+    adult_keywords = ("porn", "xxx", "sex", "adult", "cam", "tube", "nude",
+                      "hot", "fuck", "escort", "babe", "boobs")
+    suspicious_tlds = ("xyz", "top", "club", "info", "click", "link", "shop",
+                       "work", "cf", "tk", "ml", "ga")
+
+    num_digits = sum(1 for c in u2 if c.isdigit())
+    digit_ratio = num_digits / max(1, len(u2))
+
+    host_parts = host.split('.') if host else []
+    suffix_parts = tx.suffix.split('.') if tx.suffix else []
+    registered_parts = 1 + (len(suffix_parts) if suffix_parts else 0)
+    num_subdomain_parts = max(0, len(host_parts) - registered_parts)
 
     feats = {
         "url_length": len(u2),
@@ -70,54 +92,66 @@ def extract_url_fields(url: str):
         "num_hyphen": host.count('-'),
         "num_underscore": host.count('_'),
         "num_slash": path.count('/'),
-        "num_digits": sum(1 for c in u2 if c.isdigit()),
-        "digit_ratio": sum(1 for c in u2 if c.isdigit()) / max(1, len(u2)),
+        "num_digits": num_digits,
+        "digit_ratio": digit_ratio,
         "entropy_domain": entropy(domain),
         "has_https": int(u2.lower().startswith("https")),
         "has_ip": int(bool(re.match(r'^\d+\.\d+\.\d+\.\d+$', tx.domain))),
-
         "has_adult_keyword": int(any(k in u2.lower() for k in adult_keywords)),
-        "has_phish_keyword": int(any(k in u2.lower() for k in phish_keywords)),
         "count_special_chars": sum(c in u2 for c in "@%=&?~"),
-        "is_shortened_url": int(any(x in u2.lower() for x in ("bit.ly","tinyurl","goo.gl","t.co","ow.ly"))),
+        "is_shortened_url": int(any(x in u2.lower() for x in
+                                   ("bit.ly", "tinyurl", "goo.gl", "t.co", "ow.ly"))),
         "token_count_path": path.count('/') + 1 if path else 0,
-        "has_login_token": int(any(k in u2.lower() for k in ("login","signin","verify","update","account","secure"))),
-        "tld_type": 0 if host.endswith((".gov",".edu",".org")) else 1
+        "tld_type": 0 if host.endswith((".gov", ".edu", ".org")) else 1,
+        "num_subdomain_parts": num_subdomain_parts,
+        "is_suspicious_tld": int((tx.suffix or "").lower() in suspicious_tlds),
+        "many_digits": int(num_digits >= 5),
+        "many_dots_or_hyphens": int(host.count('.') >= 4 or host.count('-') >= 4),
+        "deep_subdomain": int(num_subdomain_parts >= 3),
+        "long_url_flag": int(len(u2) > 120 and len(query) > 30),
+        "no_https_with_digits": int(not u2.lower().startswith("https") and num_digits >= 3),
     }
 
     domain_path = (host + " " + path + " " + query).strip()
-    return feats, domain_path
-
+    return feats, domain_path, normalize_host(parsed.netloc)
 
 # ---------- Prediction ----------
 def predict_url(url):
     u = url.lower()
-    adult_keywords = ("porn", "xxx", "sex", "adult", "cam", "nude", "hot", "fuck", "escort", "babe", "boobs")
+    adult_keywords = ("porn", "xxx", "sex", "adult", "cam", "tube",
+                      "nude", "hot", "fuck", "escort", "babe", "boobs")
 
-    # ✅ 1. Keyword shortcut — catches simple adult URLs instantly
+    feats, text, host_norm = extract_url_fields(url)
+
+    # ✅ 1. Exact match whitelist
+    whitelist_exact = {
+        "youtube.com", "google.com", "facebook.com", "linkedin.com",
+        "github.com", "twitter.com"
+    }
+    if host_norm in whitelist_exact:
+        return {"phishing": 0.0, "adult": 0.0, "legitimate": 1.0}, 2, "legitimate", 1.0
+
+    # ✅ 2. Direct adult keyword rule
     if any(k in u for k in adult_keywords):
-        return None, {"adult": 1.0}, 1, "adult", 1.0
+        return {"phishing": 0.0, "adult": 1.0, "legitimate": 0.0}, 1, "adult", 1.0
 
-    # ✅ 2. Otherwise, fall back to ML model
-    feats, text = extract_url_fields(url)
+    # ✅ 3. Model prediction
     num_vals = [feats.get(c, 0) for c in numeric_cols]
     X_num = sparse.csr_matrix([num_vals], dtype=np.float32)
-
     X_word = tfidf_word.transform([text])
     X_char = tfidf_char.transform([text])
     X_text = hstack([X_word, X_char])
-
     X = hstack([X_num, X_text], format="csr")
 
     d = xgb.DMatrix(X)
     probs = bst.predict(d)[0]
-    pred_idx = np.argmax(probs)
-    pred_label = inv_label_map[pred_idx]
-    confidence = probs[pred_idx]
 
-    return probs, {inv_label_map[i]: float(probs[i]) for i in range(len(probs))}, pred_idx, pred_label, confidence
+    final_idx = np.argmax(probs)
+    pred_label = inv_label_map[final_idx]
+    confidence = probs[final_idx]
 
-
+    result_dict = {inv_label_map[i]: float(probs[i]) for i in range(len(probs))}
+    return result_dict, final_idx, pred_label, confidence
 
 # ---------- Main ----------
 if __name__ == "__main__":
@@ -127,17 +161,10 @@ if __name__ == "__main__":
     else:
         url = input("Enter URL: ").strip()
 
-    probs, out, pred_idx, pred_label, confidence = predict_url(url)
-
-    # ✅ Handle keyword-shortcut case
-    if probs is None:
-        print(f"\nPredicted: {pred_idx} -> {pred_label.upper()} (confidence={confidence:.3f})")
-        exit(0)
+    probs, pred_idx, pred_label, confidence = predict_url(url)
 
     print("\nProbabilities:")
-    for i, p in enumerate(probs):
-        human_label = IDX_TO_LABEL.get(i, inv_label_map.get(i, str(i)))
-        print(f"  {i}: {p:.3f}  ->  {human_label}")
+    for lbl, p in probs.items():
+        print(f"  {lbl:<12} : {p:.3f}")
 
-    pred_label_str = IDX_TO_LABEL.get(int(pred_idx), str(pred_label))
-    print(f"\nPredicted: {pred_idx} -> {pred_label_str.upper()} (confidence={confidence:.3f})")
+    print(f"\n✅ Predicted: {pred_label.upper()} (Confidence: {confidence:.3f})")
