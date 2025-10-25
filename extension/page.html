@@ -1,0 +1,30 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Test Page</title></head>
+<body>
+  <h1>My test page</h1>
+  <p>This is some sample content...</p>
+
+  <button id="analyzeBtn">Analyze page for adult content</button>
+  <pre id="out"></pre>
+
+  <script>
+    document.getElementById("analyzeBtn").onclick = async function(){
+      const html = document.documentElement.outerHTML;
+      const base = location.href;
+      try {
+        const res = await fetch("http://localhost:5000/analyze", {
+          method: "POST",
+          headers: {"Content-Type":"application/json"},
+          body: JSON.stringify({ html: html, base_url: base })
+        });
+        const data = await res.json();
+        document.getElementById("out").textContent = JSON.stringify(data, null, 2);
+        console.log("ANALYZE RESULT", data);
+      } catch(e){
+        document.getElementById("out").textContent = "Error: " + e;
+      }
+    };
+  </script>
+</body>
+</html>
